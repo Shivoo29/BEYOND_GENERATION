@@ -1,0 +1,15 @@
+torch
+torchvision
+numpy
+pandas
+scipy
+scikit-learn
+spectral
+gdal
+opencv-python
+matplotlib
+seaborn
+tqdm
+pyyaml
+wandb
+h5py
