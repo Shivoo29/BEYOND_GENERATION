@@ -1,0 +1,18 @@
+# Landsat Download URLs
+
+
+## Salinas Valley, California
+Location: 36.6, -121.0
+Earth Explorer: https://earthexplorer.usgs.gov/
+Coordinates to enter: 36.6 -121.0
+Date range: 2023-06-15 ± 3 months
+Output file: data/downloads/thermal/salinas_thermal.tif
+--------------------------------------------------
+
+## San Diego Airport
+Location: 32.73, -117.19
+Earth Explorer: https://earthexplorer.usgs.gov/
+Coordinates to enter: 32.73 -117.19
+Date range: 2023-06-15 ± 3 months
+Output file: data/downloads/thermal/san_diego_thermal.tif
+--------------------------------------------------
