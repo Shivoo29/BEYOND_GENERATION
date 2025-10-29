@@ -3,42 +3,44 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import rasterio
 from pathlib import Path
-from src.config import config
+from .config import config
 import os
+import kagglehub
+import cv2
 
 class ThermalDataset(Dataset):
     """
     Dataset for thermal infrared anomaly detection.
-    Handles 2-band GeoTIFFs where:
-    - Band 1: Thermal data (Input)
-    - Band 2: Ground Truth Mask (Label)
+    Handles GeoTIFFs, resizing them to a uniform target size.
     """
     
-    def __init__(self, data_dir, split='train', transform=None):
+    def __init__(self, data_dir, split='train', transform=None, has_gt=True, target_size=(256, 256)):
         self.data_dir = Path(data_dir)
         self.split = split
         self.transform = transform
+        self.has_gt = has_gt
+        self.target_size = target_size
         self.samples = self._load_samples()
-        print(f"Found {len(self.samples)} thermal scenes for the '{split}' split.")
+        print(f"Found {len(self.samples)} thermal scenes for the '{split}' split from '{self.data_dir}'.")
         
     def _load_samples(self):
         """
-        Scan the data directory for the 2-band GeoTIFF files.
+        Scan the data directory recursively for GeoTIFF files.
         """
         samples = []
-        # Point to the directory where the GEE exports were saved.
-        # Note: The problem statement does not specify a train/val/test split for this new data.
-        # We will create our own split from the downloaded files.
-        thermal_dir = self.data_dir / 'raw' / 'HSI_Thermal_Exports'
+        thermal_dir = self.data_dir
         
         if not thermal_dir.exists():
             print(f"Warning: Directory not found {thermal_dir}")
             return samples
 
-        all_files = sorted([str(p) for p in thermal_dir.glob('*.tif')])
+        all_files = sorted([str(p) for p in thermal_dir.rglob('*.tif')])
         
-        # Create a deterministic train/val/test split (e.g., 70/15/15)
-        np.random.seed(42) # for reproducibility
+        if not all_files:
+            print(f"Warning: No .tif files found in {thermal_dir} or its subdirectories.")
+            return samples
+            
+        np.random.seed(42)
         np.random.shuffle(all_files)
         
         n_samples = len(all_files)
@@ -49,7 +51,7 @@ class ThermalDataset(Dataset):
             samples = all_files[:n_train]
         elif self.split == 'val':
             samples = all_files[n_train:n_train + n_val]
-        else: # test
+        else:
             samples = all_files[n_train + n_val:]
             
         return samples
@@ -62,40 +64,38 @@ class ThermalDataset(Dataset):
         
         try:
             with rasterio.open(filepath) as src:
-                # Read Band 1 as the thermal image
-                thermal_img = src.read(1).astype(np.float32)
-                
-                # Read Band 2 as the ground truth mask
-                gt_mask = src.read(2).astype(np.float32)
+                if self.has_gt and src.count >= 2:
+                    thermal_img = src.read(1).astype(np.float32)
+                    gt_mask = src.read(2).astype(np.float32)
+                else:
+                    thermal_img = src.read(1).astype(np.float32)
+                    gt_mask = np.zeros_like(thermal_img, dtype=np.float32)
 
         except Exception as e:
             print(f"Error reading file {filepath}: {e}")
-            # Return dummy data if file is corrupt
             return {
-                'thermal': torch.zeros(1, 256, 256),
-                'gt': torch.zeros(256, 256),
+                'thermal': torch.zeros(1, *self.target_size),
+                'gt': torch.zeros(self.target_size),
                 'name': os.path.basename(filepath)
             }
 
-        # Normalize thermal image (example: simple min-max)
+        # --- Resize to uniform dimensions ---
+        if self.target_size:
+            thermal_img = cv2.resize(thermal_img, self.target_size, interpolation=cv2.INTER_LINEAR)
+            gt_mask = cv2.resize(gt_mask, self.target_size, interpolation=cv2.INTER_NEAREST)
+
+        # Normalize thermal image
         p_low, p_high = np.percentile(thermal_img, [2, 98])
         thermal_img = np.clip(thermal_img, p_low, p_high)
         thermal_img = (thermal_img - thermal_img.min()) / (thermal_img.max() - thermal_img.min() + 1e-8)
         
-        # Binarize ground truth just in case
         gt_mask = (gt_mask > 0).astype(np.float32)
         
-        # TODO: Add tiling logic here if images are large
-        # For now, assuming images are of a manageable size or will be resized
-        
-        # Apply augmentation if specified
         if self.transform:
-            # Note: Augmentation needs to be adapted for single-band thermal
             pass
 
-        # Convert to tensors and add channel dimension
-        thermal_tensor = torch.from_numpy(thermal_img).unsqueeze(0)  # Shape: [1, H, W]
-        gt_tensor = torch.from_numpy(gt_mask)  # Shape: [H, W]
+        thermal_tensor = torch.from_numpy(thermal_img).unsqueeze(0)
+        gt_tensor = torch.from_numpy(gt_mask)
         
         return {
             'thermal': thermal_tensor,
@@ -103,32 +103,64 @@ class ThermalDataset(Dataset):
             'name': os.path.basename(filepath)
         }
 
-def get_thermal_dataloaders(batch_size=None, data_dir=None):
-    """Create thermal data loaders for the new 2-band GeoTIFFs."""
+def get_local_thermal_dataloaders(batch_size=None, data_dir=None, target_size=(256, 256)):
+    """Create thermal data loaders for local GeoTIFFs."""
     batch_size = batch_size or config.batch_size
-    data_dir = data_dir or config.data_dir
+    local_data_dir = Path(data_dir or config.data_dir) / 'raw' / 'thermal'
 
-    train_dataset = ThermalDataset(data_dir, split='train')
-    val_dataset = ThermalDataset(data_dir, split='val')
+    train_dataset = ThermalDataset(local_data_dir, split='train', has_gt=True, target_size=target_size)
+    val_dataset = ThermalDataset(local_data_dir, split='val', has_gt=True, target_size=target_size)
     
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        print("Training or validation dataset is empty. Check data directory and splits.")
+    if len(train_dataset) == 0:
+        print("Training dataset for local thermal data is empty. Check data directory.")
         return None, None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
     
     return train_loader, val_loader
+
+def get_kaggle_thermal_dataloaders(batch_size=None, target_size=(256, 256)):
+    """Creates thermal data loaders for the FLAME 3 Kaggle dataset."""
+    print("Setting up Kaggle thermal dataset: 'brycehopkins/flame-3-nadir-thermal-plot-subset'")
+    
+    try:
+        dataset_path = kagglehub.load_dataset("brycehopkins/flame-3-nadir-thermal-plot-subset")
+        print(f"Kaggle dataset downloaded to: {dataset_path}")
+    except Exception as e:
+        print(f"Failed to download Kaggle dataset. Please ensure you have run 'kaggle login'. Error: {e}")
+        return None, None
+
+    batch_size = batch_size or config.batch_size
+
+    train_dataset = ThermalDataset(dataset_path, split='train', has_gt=False, target_size=target_size)
+    val_dataset = ThermalDataset(dataset_path, split='val', has_gt=False, target_size=target_size)
+
+    if len(train_dataset) == 0:
+        print("Kaggle thermal dataset is empty after splitting. Check downloaded files.")
+        return None, None
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
+    
+    return train_loader, val_loader
+
+if __name__ == '__main__':
+    print("--- Testing Local Thermal Data Loader ---")
+    local_train, local_val = get_local_thermal_dataloaders(batch_size=2, data_dir='./data')
+    if local_train and len(local_train) > 0:
+        print("Local thermal loader OK.")
+        batch = next(iter(local_train))
+        print(f"Image batch shape: {batch['thermal'].shape}")
+    else:
+        print("Could not initialize local thermal loader. Check the contents of ./data/raw/thermal/")
+
+    print("\n--- Testing Kaggle Thermal Data Loader ---")
+    print("This will attempt to download the dataset from Kaggle.")
+    kaggle_train, kaggle_val = get_kaggle_thermal_dataloaders(batch_size=2)
+    if kaggle_train and len(kaggle_train) > 0:
+        print("Kaggle thermal loader OK.")
+        batch = next(iter(kaggle_train))
+        print(f"Image batch shape: {batch['thermal'].shape}")
+    else:
+        print("Could not initialize Kaggle thermal loader. Please check your Kaggle API setup.")
