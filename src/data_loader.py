@@ -1,60 +1,22 @@
 """
-Updated data loader for your specific dataset structure
-Handles the abu, salinas, hydice, and pavia datasets
+Updated data loader for HSI datasets.
+Handles .mat and .he5 files, automatically reshapes 2D data to 3D,
+and pads all samples to have a uniform number of channels.
 """
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
 from pathlib import Path
 import scipy.io
 import h5py
+from PIL import Image
 from typing import Dict, List, Tuple, Optional
 
 class HyperspectralDataset(Dataset):
     """Dataset loader for your specific file structure"""
-    
-    DATASET_CONFIGS = {
-        'abu_airport': {
-            'files': ['abu-airport-1.mat', 'abu-airport-2.mat', 'abu-airport-3.mat', 
-                     'abu-airport-4.mat', 'Airport.mat'],
-            'data_key': ['data', 'Data', 'array'],
-            'gt_key': ['map', 'Map', 'groundtruth', 'GT']
-        },
-        'abu_beach': {
-            'files': ['abu-beach-1.mat', 'abu-beach-2.mat', 'abu-beach-3.mat', 
-                     'abu-beach-4.mat', 'Beach.mat'],
-            'data_key': ['data', 'Data', 'array'],
-            'gt_key': ['map', 'Map', 'groundtruth', 'GT']
-        },
-        'abu_urban': {
-            'files': ['abu-urban-1.mat', 'abu-urban-2.mat', 'abu-urban-3.mat',
-                     'abu-urban-4.mat', 'abu-urban-5.mat'],
-            'data_key': ['data', 'Data', 'array'],
-            'gt_key': ['map', 'Map', 'groundtruth', 'GT']
-        },
-        'hydice_urban': {
-            'files': ['HYDICE_urban.mat'],
-            'data_key': ['data', 'Data', 'array', 'img'],
-            'gt_key': ['map', 'Map', 'groundtruth', 'GT', 'gt']
-        },
-        'paviaC': {
-            'files': ['paviac_data.emf'],  # Note: EMF format needs special handling
-            'data_key': ['data'],
-            'gt_key': ['gt']
-        },
-        'salinas': {
-            'files': ['Salinas_120_sj25_gt.mat', 'Salinas_120_120.hdr'],
-            'data_key': ['ImgCube_120', 'data', 'Data'],
-            'gt_key': ['GT', 'gt', 'groundtruth']
-        },
-        'san_diego': {
-            'files': ['SanDiego.mat', 'SandiegoData.mat'],
-            'data_key': ['data', 'Data', 'array'],
-            'gt_key': ['map', 'Map', 'groundtruth', 'GT']
-        }
-    }
     
     def __init__(self, 
                  data_dir: str,
@@ -64,16 +26,7 @@ class HyperspectralDataset(Dataset):
                  tile_size: int = 256,
                  stride: int = 128,
                  test_mode: bool = False):
-        """
-        Args:
-            data_dir: Root directory (should contain raw/hsi/)
-            split: 'train', 'val', or 'test'
-            transform: Augmentation pipeline
-            preprocessor: Preprocessing pipeline
-            tile_size: Size of tiles to extract
-            stride: Stride for tile extraction
-            test_mode: If True, use smaller subset for testing
-        """
+
         self.data_dir = Path(data_dir)
         self.split = split
         self.transform = transform
@@ -82,137 +35,148 @@ class HyperspectralDataset(Dataset):
         self.stride = stride if split == 'train' else tile_size
         self.test_mode = test_mode
         
+        # Load samples and determine max bands for padding
         self.samples = self._load_samples()
-        print(f"Loaded {len(self.samples)} samples for {split} split")
+        self.max_bands = self._get_max_bands()
+        if self.max_bands > 0:
+            print(f"Found datasets with varying bands. All samples will be padded to {self.max_bands} bands.")
+
+        print(f"Loaded {len(self.samples)} HSI samples for {self.split} split")
     
-    def _load_mat_file_robust(self, filepath: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _get_max_bands(self) -> int:
+        """Iterate through all samples to find the max number of bands."""
+        max_bands = 0
+        if not self.samples:
+            return 0
+        for sample in self.samples:
+            bands = sample['data'].shape[2]
+            if bands > max_bands:
+                max_bands = bands
+        return max_bands
+
+    def _load_file_robust(self, filepath: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[int]]:
         """
-        Robustly load .mat files, trying different keys and methods
-        Returns: (data, ground_truth) or (None, None) if failed
+        Robustly load .mat or .he5 files, trying different keys.
+        Returns: (data, ground_truth, height, width) or (None, None, None, None)
         """
+        data, gt, h, w = None, None, None, None
+        
+        common_data_keys = ['data', 'Data', 'array', 'img', 'ImgCube_120', 'X', 'HSI', 'hsi']
+        common_gt_keys = ['map', 'Map', 'groundtruth', 'GT', 'gt', 'mask']
+        common_h_keys = ['h', 'height', 'lines']
+        common_w_keys = ['w', 'width', 'samples']
+
         try:
-            # Try scipy.io first
-            mat_data = scipy.io.loadmat(filepath)
-            
-            # Common data keys to try
-            data_keys = ['data', 'Data', 'array', 'img', 'ImgCube_120', 'X', 'HSI', 'hsi']
-            gt_keys = ['map', 'Map', 'groundtruth', 'GT', 'gt', 'mask']
-            
-            data = None
-            gt = None
-            
-            # Find data
-            for key in data_keys:
-                if key in mat_data and isinstance(mat_data[key], np.ndarray):
-                    if mat_data[key].ndim >= 2:
-                        data = mat_data[key]
-                        break
-            
-            # Find ground truth
-            for key in gt_keys:
-                if key in mat_data and isinstance(mat_data[key], np.ndarray):
-                    gt = mat_data[key]
+            if filepath.endswith('.mat'):
+                try:
+                    file_data = scipy.io.loadmat(filepath)
+                except NotImplementedError:
+                    file_data = h5py.File(filepath, 'r')
+            elif filepath.endswith('.he5'):
+                file_data = h5py.File(filepath, 'r')
+            else:
+                return None, None, None, None
+
+            for key in common_data_keys:
+                if key in file_data and isinstance(file_data[key], (np.ndarray, h5py.Dataset)):
+                    data = np.array(file_data[key])
                     break
             
-            # If not found, try to find the largest arrays
+            for key in common_gt_keys:
+                if key in file_data and isinstance(file_data[key], (np.ndarray, h5py.Dataset)):
+                    gt = np.array(file_data[key])
+                    break
+
+            for key in common_h_keys:
+                if key in file_data:
+                    h = int(np.array(file_data[key]).squeeze())
+                    break
+            
+            for key in common_w_keys:
+                if key in file_data:
+                    w = int(np.array(file_data[key]).squeeze())
+                    break
+
             if data is None:
-                arrays = [(k, v) for k, v in mat_data.items() 
-                         if isinstance(v, np.ndarray) and not k.startswith('__')]
+                arrays = [(k, v) for k, v in file_data.items() 
+                         if isinstance(v, (np.ndarray, h5py.Dataset)) and not k.startswith('__')]
                 if arrays:
-                    # Sort by size and take the largest as data
                     arrays.sort(key=lambda x: x[1].size, reverse=True)
-                    data = arrays[0][1]
-                    if len(arrays) > 1:
-                        gt = arrays[1][1]
-            
-            return data, gt
-            
-        except NotImplementedError:
-            # Try h5py for v7.3 mat files
-            try:
-                with h5py.File(filepath, 'r') as f:
-                    # Similar key search for HDF5
-                    data = None
-                    gt = None
-                    
-                    for key in ['data', 'Data', 'array', 'img']:
-                        if key in f:
-                            data = np.array(f[key])
-                            break
-                    
-                    for key in ['map', 'Map', 'groundtruth', 'GT', 'gt']:
-                        if key in f:
-                            gt = np.array(f[key])
-                            break
-                    
-                    return data, gt
-            except:
-                pass
+                    data = np.array(arrays[0][1])
+                    if len(arrays) > 1 and gt is None:
+                        gt = np.array(arrays[1][1])
+
+            if isinstance(file_data, h5py.File):
+                file_data.close()
+
+            return data, gt, h, w
+
         except Exception as e:
-            print(f"Error loading {filepath}: {e}")
-        
-        return None, None
-    
-    def _scan_available_data(self) -> Dict[str, List[Dict]]:
-        """Scan the data directory for available datasets"""
-        available = {}
+            print(f"ERROR: Could not load file {filepath}: {e}")
+            return None, None, None, None
+
+    def _scan_available_data(self) -> List[Dict]:
+        """Scan the data directory for available datasets."""
+        all_files = []
         hsi_dir = self.data_dir / 'raw' / 'hsi'
-        
-        if not hsi_dir.exists():
+        mock_dir = self.data_dir.parent / 'mock_dataset_15_oct'
+
+        if hsi_dir.exists():
+            for ext in ['*.mat', '*.he5']:
+                all_files.extend(hsi_dir.rglob(ext))
+        else:
             print(f"Warning: HSI directory {hsi_dir} not found")
-            return available
+
+        if mock_dir.exists():
+            for ext in ['*.mat', '*.he5']:
+                all_files.extend(mock_dir.rglob(ext))
+            print(f"Found mock dataset directory: {mock_dir}")
         
-        # Scan each dataset folder
-        for dataset_name in self.DATASET_CONFIGS.keys():
-            dataset_path = hsi_dir / dataset_name
-            
-            if dataset_path.exists():
-                files_found = []
-                
-                # Look for .mat files
-                for mat_file in dataset_path.glob('*.mat'):
-                    data, gt = self._load_mat_file_robust(str(mat_file))
-                    
-                    if data is not None:
-                        files_found.append({
-                            'file': str(mat_file),
-                            'data': data,
-                            'gt': gt,
-                            'name': mat_file.stem
-                        })
-                
-                if files_found:
-                    available[dataset_name] = files_found
-                    print(f"Found {len(files_found)} files in {dataset_name}")
-        
-        return available
+        files_found = []
+        for f in all_files:
+            data, gt, h, w = self._load_file_robust(str(f))
+            if data is not None:
+                files_found.append({
+                    'file': str(f),
+                    'data': data,
+                    'gt': gt,
+                    'height': h,
+                    'width': w,
+                    'name': f.stem
+                })
+        print(f"Scanned and found {len(files_found)} valid HSI data files.")
+        return files_found
     
-    def _create_tiles(self, data: np.ndarray, gt: Optional[np.ndarray]) -> List[Dict]:
-        """Create tiles from full image"""
-        tiles = []
-        
-        # Ensure correct dimension order (H, W, C)
+    def _create_tiles(self, data: np.ndarray, gt: Optional[np.ndarray], h: Optional[int], w: Optional[int], filename: str) -> List[Dict]:
+        """Create tiles from a full image, handling dimensionality."""
+        if data.ndim == 2 and h is not None and w is not None:
+            if data.shape[0] == h * w:
+                print(f"Info ({filename}): Reshaping 2D data ({data.shape}) to 3D ({h}, {w}, -1) using metadata.")
+                data = data.reshape(h, w, -1)
+            else:
+                print(f"Warning ({filename}): H*W from metadata ({h*w}) does not match data size ({data.shape[0]}). Cannot reshape.")
+
         if data.ndim == 3:
-            if data.shape[0] < data.shape[2]:  # (C, H, W) format
+            if data.shape[0] < data.shape[2] and data.shape[0] < data.shape[1]:
                 data = np.transpose(data, (1, 2, 0))
         elif data.ndim == 2:
+            print(f"Warning ({filename}): Data is 2D and could not be reshaped. Assuming single channel image.")
             data = np.expand_dims(data, -1)
         
         H, W = data.shape[:2]
         
-        # Create synthetic GT if none provided
         if gt is None:
-            print("Warning: No ground truth found, creating synthetic anomalies")
-            gt = (np.random.random((H, W)) > 0.98).astype(np.float32)
+            gt = np.zeros((H, W), dtype=np.float32)
         
-        # Ensure GT is 2D
         if gt.ndim == 3:
             gt = gt.squeeze()
-        
-        # Binarize GT
+        if gt.shape != (H, W):
+            print(f"Warning ({filename}): GT shape {gt.shape} mismatch with data shape {(H,W)}. Resizing GT.")
+            gt = np.array(Image.fromarray(gt).resize((W, H), Image.NEAREST))
+
         gt = (gt > 0).astype(np.float32)
         
-        # If image is smaller than tile size, pad it
+        tiles = []
         if H < self.tile_size or W < self.tile_size:
             pad_h = max(0, self.tile_size - H)
             pad_w = max(0, self.tile_size - W)
@@ -220,54 +184,48 @@ class HyperspectralDataset(Dataset):
             gt = np.pad(gt, ((0, pad_h), (0, pad_w)), mode='constant')
             H, W = data.shape[:2]
         
-        # Extract tiles
-        for h in range(0, H - self.tile_size + 1, self.stride):
-            for w in range(0, W - self.tile_size + 1, self.stride):
-                tile_data = data[h:h+self.tile_size, w:w+self.tile_size]
-                tile_gt = gt[h:h+self.tile_size, w:w+self.tile_size]
+        for h_start in range(0, H - self.tile_size + 1, self.stride):
+            for w_start in range(0, W - self.tile_size + 1, self.stride):
+                tile_data = data[h_start:h_start+self.tile_size, w_start:w_start+self.tile_size]
+                tile_gt = gt[h_start:h_start+self.tile_size, w_start:w_start+self.tile_size]
                 
-                # For training, keep tiles with anomalies
-                # For val/test, keep all tiles
-                if self.split != 'train' or tile_gt.sum() > 0:
+                if self.split != 'train' or tile_gt.sum() > 0 or np.random.random() < 0.1:
                     tiles.append({'data': tile_data, 'gt': tile_gt})
-        
         return tiles
     
     def _load_samples(self) -> List[Dict]:
-        """Load all samples"""
+        """Load all samples from all found data files."""
         samples = []
         available_data = self._scan_available_data()
         
         if not available_data:
-            print("Warning: No data found. Check your data directory structure.")
-            print(f"Expected path: {self.data_dir / 'raw' / 'hsi'}")
+            print("CRITICAL: No HSI data found. Check your data directory structure.")
             return samples
         
-        # Process each dataset
-        for dataset_name, file_list in available_data.items():
-            for file_info in file_list:
-                data = file_info['data']
-                gt = file_info['gt']
-                
-                # Normalize data
-                if self.preprocessor:
-                    from src.preprocessing import HyperspectralPreprocessor
-                    preprocessor = HyperspectralPreprocessor()
-                    data = preprocessor(data)
-                else:
-                    # Simple normalization
-                    data = (data - data.min()) / (data.max() - data.min() + 1e-8)
-                
-                # Create tiles
-                tiles = self._create_tiles(data, gt)
-                
-                # Add metadata
-                for tile in tiles:
-                    tile['dataset'] = dataset_name
-                    tile['source_file'] = file_info['name']
-                    samples.append(tile)
+        for file_info in available_data:
+            data, gt = file_info['data'], file_info['gt']
+            h, w = file_info['height'], file_info['width']
+            
+            # Handle dimensionality before preprocessing
+            if data.ndim == 2 and h is not None and w is not None and data.shape[0] == h * w:
+                data = data.reshape(h, w, -1)
+            elif data.ndim == 3 and data.shape[0] < data.shape[2] and data.shape[0] < data.shape[1]:
+                data = np.transpose(data, (1, 2, 0))
+            elif data.ndim == 2:
+                data = np.expand_dims(data, -1)
+
+            if self.preprocessor:
+                data = self.preprocessor(data)
+            else:
+                data = (data - data.min()) / (data.max() - data.min() + 1e-8)
+            
+            tiles = self._create_tiles(data, gt, h, w, file_info['name'])
+            
+            for tile in tiles:
+                tile['dataset'] = Path(file_info['file']).parent.name
+                tile['source_file'] = file_info['name']
+                samples.append(tile)
         
-        # Split into train/val/test
         np.random.seed(42)
         np.random.shuffle(samples)
         
@@ -276,35 +234,38 @@ class HyperspectralDataset(Dataset):
         n_val = int(0.15 * n_samples)
         
         if self.split == 'train':
-            samples = samples[:n_train]
+            split_samples = samples[:n_train]
         elif self.split == 'val':
-            samples = samples[n_train:n_train + n_val]
-        else:  # test
-            samples = samples[n_train + n_val:]
+            split_samples = samples[n_train:n_train + n_val]
+        else:
+            split_samples = samples[n_train + n_val:]
         
-        # For test mode, use only first 10 samples
         if self.test_mode:
-            samples = samples[:10]
-        
-        return samples
+            return split_samples[:10]
+        return split_samples
     
     def __len__(self) -> int:
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
-        
         data = sample['data'].copy()
         gt = sample['gt'].copy()
         
-        # Apply augmentation
         if self.transform and self.split == 'train':
             data, gt = self.transform(data, gt)
         
-        # Convert to tensors
-        data_tensor = torch.from_numpy(data).float()
-        gt_tensor = torch.from_numpy(gt).float()
+        data_tensor = torch.from_numpy(data.transpose(2, 0, 1).copy()).float() # (C, H, W)
+        gt_tensor = torch.from_numpy(gt.copy()).float()
         
+        # Pad channels to max_bands
+        if self.max_bands > 0:
+            c, h, w = data_tensor.shape
+            if c < self.max_bands:
+                padding_size = self.max_bands - c
+                # Pad at the end of the channel dimension
+                data_tensor = F.pad(data_tensor, (0, 0, 0, 0, 0, padding_size), "constant", 0)
+
         return {
             'image': data_tensor,
             'gt': gt_tensor,
@@ -316,82 +277,63 @@ def get_dataloaders(batch_size: int = 8,
                    data_dir: str = './data',
                    num_workers: int = 4,
                    test_mode: bool = False) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create dataloaders for your specific data structure
-    
-    Args:
-        batch_size: Batch size for training
-        data_dir: Root data directory
-        num_workers: Number of parallel workers
-        test_mode: If True, use small subset for testing
-    
-    Returns:
-        train_loader, val_loader
-    """
-    # Import preprocessing
+    """Create dataloaders for HSI data."""
     try:
-        from src.preprocessing import HyperspectralPreprocessor, DataAugmentation
+        from .preprocessing import HyperspectralPreprocessor, DataAugmentation
         preprocessor = HyperspectralPreprocessor(normalize_method='minmax')
         augmentor = DataAugmentation(flip_prob=0.5, rotate_prob=0.3)
-    except:
-        preprocessor = None
-        augmentor = None
-        print("Warning: Preprocessing module not found, using basic normalization")
+    except ImportError:
+        preprocessor, augmentor = None, None
+        print("Warning: Preprocessing module not found, using basic normalization.")
     
-    # Create datasets
     train_dataset = HyperspectralDataset(
-        data_dir=data_dir,
-        split='train',
-        transform=augmentor,
-        preprocessor=preprocessor,
-        tile_size=256,
-        stride=128,
-        test_mode=test_mode
+        data_dir=data_dir, split='train', transform=augmentor,
+        preprocessor=preprocessor, test_mode=test_mode
     )
-    
     val_dataset = HyperspectralDataset(
-        data_dir=data_dir,
-        split='val',
-        transform=None,
-        preprocessor=preprocessor,
-        tile_size=256,
-        stride=256,
-        test_mode=test_mode
+        data_dir=data_dir, split='val', transform=None,
+        preprocessor=preprocessor, test_mode=test_mode
     )
     
-    # Create loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    if len(train_dataset) == 0:
+        print("HSI training dataset is empty. Cannot create DataLoader.")
+        train_loader = None
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True, drop_last=True
+        )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    if len(val_dataset) == 0:
+        print("HSI validation dataset is empty. Cannot create DataLoader.")
+        val_loader = None
+    else:
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True
+        )
     
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    if train_loader and val_loader:
+        print(f"HSI DataLoaders created: {len(train_loader)} train batches, {len(val_loader)} val batches.")
     
     return train_loader, val_loader
 
 
 if __name__ == "__main__":
-    # Test the data loader
-    print("Testing data loader with your data structure...")
-    train_loader, val_loader = get_dataloaders(batch_size=2, test_mode=True)
+    print("Testing HSI data loader...")
+    project_root = Path(__file__).parent.parent
+    train_loader, val_loader = get_dataloaders(batch_size=2, data_dir=str(project_root / 'data'), test_mode=True)
     
-    if len(train_loader) > 0:
-        batch = next(iter(train_loader))
-        print(f"Successfully loaded data!")
-        print(f"Image shape: {batch['image'].shape}")
-        print(f"GT shape: {batch['gt'].shape}")
-        print(f"Sample names: {batch['name']}")
+    if train_loader and len(train_loader) > 0:
+        try:
+            for i, batch in enumerate(train_loader):
+                print(f"Successfully loaded batch {i+1}!")
+                print(f"  Image batch shape: {batch['image'].shape}")
+                print(f"  GT batch shape: {batch['gt'].shape}")
+                if i == 0: # Check one batch is enough
+                    break
+        except Exception as e:
+            print(f"\nERROR during batch loading: {e}")
+            print("This likely means there is still a data shape mismatch.")
     else:
-        print("No data loaded. Check your data directory structure.")
+        print("\nCould not load a batch from HSI train_loader.")
