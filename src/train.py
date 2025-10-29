@@ -3,9 +3,10 @@ import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import wandb
-from src.config import config
-from src.stage1_lrsr import LRSR
-from src.stage2_ebt import EnergyBasedTransformer
+from .config import config
+from .stage1_lrsr import LRSR
+from .stage2_ebt import EnergyBasedTransformer
+from .data_loader import get_dataloaders
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, device='cuda'):
@@ -30,7 +31,6 @@ class Trainer:
         
     def generate_negatives(self, gt):
         """Generate negative samples for contrastive learning"""
-        # Random flip negatives
         negatives = []
         for i in range(gt.shape[0]):
             neg = gt[i].clone()
@@ -48,36 +48,32 @@ class Trainer:
             images = batch['image'].to(self.device)
             gts = batch['gt'].to(self.device)
             
-            # Compute LRSR decomposition (cache this in practice)
+            # The model expects (B, H, W, C) but loader gives (B, C, H, W)
+            images_for_model = images.permute(0, 2, 3, 1)
+
             sparse_components = []
-            for img in images:
+            for img in images_for_model:
                 img_np = img.cpu().numpy()
                 _, S = self.lrsr(img_np)
                 sparse_components.append(torch.from_numpy(S))
-            S_batch = torch.stack(sparse_components).to(self.device)
+            S_batch = torch.stack(sparse_components).to(self.device).float()
             
-            # Generate negative samples
             negatives = self.generate_negatives(gts)
             
             self.optimizer.zero_grad()
             
-            if config.mixed_precision:
+            if config.mixed_precision and self.scaler:
                 with autocast():
-                    # Positive energy (should be low)
-                    pos_energy = self.model(images, S_batch, gts)
-                    
-                    # Negative energy (should be high)
-                    neg_energy = self.model(images, S_batch, negatives)
-                    
-                    # Contrastive loss
+                    pos_energy = self.model(images_for_model, S_batch, gts)
+                    neg_energy = self.model(images_for_model, S_batch, negatives)
                     loss = pos_energy - neg_energy
                 
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                pos_energy = self.model(images, S_batch, gts)
-                neg_energy = self.model(images, S_batch, negatives)
+                pos_energy = self.model(images_for_model, S_batch, gts)
+                neg_energy = self.model(images_for_model, S_batch, negatives)
                 loss = pos_energy - neg_energy
                 
                 loss.backward()
@@ -90,15 +86,12 @@ class Trainer:
         return total_loss / len(self.train_loader)
     
     def validate(self):
-        # TODO: Implement validation with metrics
         pass
     
-    def train(self):
-        for epoch in range(config.num_epochs):
+    def train(self, num_epochs):
+        for epoch in range(num_epochs):
             train_loss = self.train_epoch(epoch)
             print(f'Epoch {epoch}: Loss = {train_loss:.4f}')
-            
-            # Save checkpoint
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(epoch)
     
@@ -108,5 +101,30 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
         }
-        path = f'{config.checkpoint_dir}/checkpoint_epoch_{epoch}.pt'
-        torch.save(checkpoint, path)    
+        path = f'{config.checkpoint_dir}/hsi_checkpoint_epoch_{epoch}.pt'
+        if not os.path.exists(config.checkpoint_dir):
+            os.makedirs(config.checkpoint_dir)
+        torch.save(checkpoint, path)
+        print(f"Saved HSI checkpoint to {path}")
+
+if __name__ == '__main__':
+    print("--- Running a test of the HSI Trainer ---")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
+    # 1. Load Data
+    train_loader, val_loader = get_dataloaders(batch_size=2, test_mode=True)
+
+    if train_loader:
+        # 2. Initialize Model
+        model = EnergyBasedTransformer()
+
+        # 3. Initialize Trainer
+        hsi_trainer = Trainer(model, train_loader, val_loader, device=device)
+
+        # 4. Run for one epoch
+        print("Starting a single epoch test...")
+        hsi_trainer.train(num_epochs=1)
+        print("\n--- HSI Trainer test finished successfully! ---")
+    else:
+        print("Could not run HSI trainer test because data loader failed.")
