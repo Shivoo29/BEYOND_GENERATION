@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from scipy.linalg import svd
-from src.config import config
+from .config import config
 
 class LRSR:
     """Low-Rank and Sparse Representation using ADMM"""
