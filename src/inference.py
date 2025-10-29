@@ -1,7 +1,7 @@
 import torch
 import numpy as np
-from src.config import config
-from src.stage1_lrsr import LRSR
+from .config import config
+from .stage1_lrsr import LRSR
 
 class InferencePipeline:
     """Complete inference pipeline with iterative refinement"""
