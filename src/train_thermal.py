@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from src.thermal_model import ThermalAnomalyDetector
-from src.config import config
+from .thermal_model import ThermalAnomalyDetector
+from .config import config
 
 class ThermalTrainer:
     """
