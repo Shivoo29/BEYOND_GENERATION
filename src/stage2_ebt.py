@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.config import config
+from .config import config
 
 class SpectralEncoder(nn.Module):
     """Encode hyperspectral signatures"""
