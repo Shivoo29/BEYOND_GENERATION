@@ -38,6 +38,13 @@ class HyperspectralDataset(Dataset):
         # Load samples and determine max bands for padding
         self.samples = self._load_samples()
         self.max_bands = self._get_max_bands()
+        # Ensure padding uses at least configured number of bands (keeps train/val consistent)
+        try:
+            from .config import config
+            if getattr(config, 'num_spectral_bands', None):
+                self.max_bands = max(self.max_bands, int(config.num_spectral_bands))
+        except Exception:
+            pass
         if self.max_bands > 0:
             print(f"Found datasets with varying bands. All samples will be padded to {self.max_bands} bands.")
 

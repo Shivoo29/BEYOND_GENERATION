@@ -6,7 +6,7 @@ class Config:
     # Data parameters
     tile_size: int = 256
     tile_overlap: int = 32
-    num_spectral_bands: int = 200
+    num_spectral_bands: int = 199
     
     # LRSR parameters
     lrsr_lambda_l: float = 0.01

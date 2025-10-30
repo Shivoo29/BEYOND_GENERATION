@@ -1,17 +1,17 @@
+"""
+Improved Thermal Data Loader with Robust Normalization
+Prevents NaN/Inf values that cause training instability
+"""
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import rasterio
 from pathlib import Path
-from .config import config
-import os
-import kagglehub
 import cv2
 
-class ThermalDataset(Dataset):
+class ThermalDatasetRobust(Dataset):
     """
-    Dataset for thermal infrared anomaly detection.
-    Handles GeoTIFFs, resizing them to a uniform target size.
+    Robust thermal dataset with improved normalization
     """
     
     def __init__(self, data_dir, split='train', transform=None, has_gt=True, target_size=(256, 256)):
@@ -21,12 +21,9 @@ class ThermalDataset(Dataset):
         self.has_gt = has_gt
         self.target_size = target_size
         self.samples = self._load_samples()
-        print(f"Found {len(self.samples)} thermal scenes for the '{split}' split from '{self.data_dir}'.")
+        print(f"Found {len(self.samples)} thermal scenes for '{split}' split")
         
     def _load_samples(self):
-        """
-        Scan the data directory recursively for GeoTIFF files.
-        """
         samples = []
         thermal_dir = self.data_dir
         
@@ -37,7 +34,7 @@ class ThermalDataset(Dataset):
         all_files = sorted([str(p) for p in thermal_dir.rglob('*.tif')])
         
         if not all_files:
-            print(f"Warning: No .tif files found in {thermal_dir} or its subdirectories.")
+            print(f"Warning: No .tif files found in {thermal_dir}")
             return samples
             
         np.random.seed(42)
@@ -56,6 +53,32 @@ class ThermalDataset(Dataset):
             
         return samples
     
+    def _robust_normalize(self, img):
+        """
+        Robust normalization that prevents NaN/Inf
+        """
+        # Remove NaN and Inf
+        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        # Clip extreme outliers using percentiles
+        p_low, p_high = np.percentile(img[img != 0], [1, 99])  # Ignore zeros
+        img_clipped = np.clip(img, p_low, p_high)
+        
+        # Robust min-max normalization
+        img_min = img_clipped.min()
+        img_max = img_clipped.max()
+        
+        if abs(img_max - img_min) < 1e-6:
+            # Constant image - return zeros
+            return np.zeros_like(img, dtype=np.float32)
+        
+        normalized = (img_clipped - img_min) / (img_max - img_min)
+        
+        # Final safety check
+        normalized = np.clip(normalized, 0, 1)
+        
+        return normalized.astype(np.float32)
+    
     def __len__(self):
         return len(self.samples)
     
@@ -72,95 +95,76 @@ class ThermalDataset(Dataset):
                     gt_mask = np.zeros_like(thermal_img, dtype=np.float32)
 
         except Exception as e:
-            print(f"Error reading file {filepath}: {e}")
+            print(f"Error reading {filepath}: {e}")
             return {
-                'thermal': torch.zeros(1, *self.target_size),
-                'gt': torch.zeros(self.target_size),
-                'name': os.path.basename(filepath)
+                'thermal': torch.zeros(1, *self.target_size, dtype=torch.float32),
+                'gt': torch.zeros(self.target_size, dtype=torch.float32),
+                'name': 'error'
             }
 
-        # --- Resize to uniform dimensions ---
+        # Resize
         if self.target_size:
             thermal_img = cv2.resize(thermal_img, self.target_size, interpolation=cv2.INTER_LINEAR)
             gt_mask = cv2.resize(gt_mask, self.target_size, interpolation=cv2.INTER_NEAREST)
 
-        # Normalize thermal image
-        p_low, p_high = np.percentile(thermal_img, [2, 98])
-        thermal_img = np.clip(thermal_img, p_low, p_high)
-        thermal_img = (thermal_img - thermal_img.min()) / (thermal_img.max() - thermal_img.min() + 1e-8)
-        
+        # Robust normalization
+        thermal_img = self._robust_normalize(thermal_img)
         gt_mask = (gt_mask > 0).astype(np.float32)
         
-        if self.transform:
-            pass
-
+        # Convert to tensors
         thermal_tensor = torch.from_numpy(thermal_img).unsqueeze(0)
         gt_tensor = torch.from_numpy(gt_mask)
         
         return {
             'thermal': thermal_tensor,
             'gt': gt_tensor,
-            'name': os.path.basename(filepath)
+            'name': Path(filepath).stem
         }
 
-def get_local_thermal_dataloaders(batch_size=None, data_dir=None, target_size=(256, 256)):
-    """Create thermal data loaders for local GeoTIFFs."""
-    batch_size = batch_size or config.batch_size
-    local_data_dir = Path(data_dir or config.data_dir) / 'raw' / 'thermal'
 
-    train_dataset = ThermalDataset(local_data_dir, split='train', has_gt=True, target_size=target_size)
-    val_dataset = ThermalDataset(local_data_dir, split='val', has_gt=True, target_size=target_size)
+def get_robust_thermal_dataloaders(batch_size=4, data_dir='./data', target_size=(256, 256)):
+    """Create thermal data loaders with robust normalization"""
+    local_data_dir = Path(data_dir) / 'raw' / 'thermal'
+
+    train_dataset = ThermalDatasetRobust(local_data_dir, split='train', has_gt=True, target_size=target_size)
+    val_dataset = ThermalDatasetRobust(local_data_dir, split='val', has_gt=True, target_size=target_size)
     
     if len(train_dataset) == 0:
-        print("Training dataset for local thermal data is empty. Check data directory.")
+        print("ERROR: Training dataset is empty!")
         return None, None
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=2,  # Reduced for stability
+        pin_memory=True,
+        drop_last=True  # Drop incomplete batches
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    print(f"✓ Loaders created: {len(train_loader)} train batches, {len(val_loader)} val batches")
     
     return train_loader, val_loader
 
-def get_kaggle_thermal_dataloaders(batch_size=None, target_size=(256, 256)):
-    """Creates thermal data loaders for the FLAME 3 Kaggle dataset."""
-    print("Setting up Kaggle thermal dataset: 'brycehopkins/flame-3-nadir-thermal-plot-subset'")
-    
-    try:
-        dataset_path = kagglehub.load_dataset("brycehopkins/flame-3-nadir-thermal-plot-subset")
-        print(f"Kaggle dataset downloaded to: {dataset_path}")
-    except Exception as e:
-        print(f"Failed to download Kaggle dataset. Please ensure you have run 'kaggle login'. Error: {e}")
-        return None, None
-
-    batch_size = batch_size or config.batch_size
-
-    train_dataset = ThermalDataset(dataset_path, split='train', has_gt=False, target_size=target_size)
-    val_dataset = ThermalDataset(dataset_path, split='val', has_gt=False, target_size=target_size)
-
-    if len(train_dataset) == 0:
-        print("Kaggle thermal dataset is empty after splitting. Check downloaded files.")
-        return None, None
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
-    
-    return train_loader, val_loader
 
 if __name__ == '__main__':
-    print("--- Testing Local Thermal Data Loader ---")
-    local_train, local_val = get_local_thermal_dataloaders(batch_size=2, data_dir='./data')
-    if local_train and len(local_train) > 0:
-        print("Local thermal loader OK.")
-        batch = next(iter(local_train))
-        print(f"Image batch shape: {batch['thermal'].shape}")
+    print("Testing robust thermal data loader...")
+    train, val = get_robust_thermal_dataloaders(batch_size=2, data_dir='./data')
+    
+    if train and len(train) > 0:
+        print("\n✓ Loader test passed!")
+        batch = next(iter(train))
+        print(f"Thermal shape: {batch['thermal'].shape}")
+        print(f"GT shape: {batch['gt'].shape}")
+        print(f"Thermal range: [{batch['thermal'].min():.3f}, {batch['thermal'].max():.3f}]")
+        print(f"GT unique values: {torch.unique(batch['gt'])}")
     else:
-        print("Could not initialize local thermal loader. Check the contents of ./data/raw/thermal/")
-
-    print("\n--- Testing Kaggle Thermal Data Loader ---")
-    print("This will attempt to download the dataset from Kaggle.")
-    kaggle_train, kaggle_val = get_kaggle_thermal_dataloaders(batch_size=2)
-    if kaggle_train and len(kaggle_train) > 0:
-        print("Kaggle thermal loader OK.")
-        batch = next(iter(kaggle_train))
-        print(f"Image batch shape: {batch['thermal'].shape}")
-    else:
-        print("Could not initialize Kaggle thermal loader. Please check your Kaggle API setup.")
+        print("\n✗ Loader test failed!")
